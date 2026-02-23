@@ -3,25 +3,18 @@ package com.example.myweather.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.myweather.BuildConfig
-import com.example.myweather.data.model.WeatherResponse
-import com.example.myweather.data.remote.RetrofitInstance
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.update
+import com.example.myweather.data.model.WeatherEntity
+import com.example.myweather.data.repository.WeatherRepository
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import retrofit2.HttpException
-import java.io.IOException
-import java.util.UUID
 
 data class CityWeatherItem(
-    val id: String = UUID.randomUUID().toString(),
     val query: String,
-    val cityName: String? = null,
-    val tempC: Int? = null,
-    val description: String? = null,
-    val icon: String? = null,
-    val error: String? = null,
-    val isLoading: Boolean = false
+    val cityName: String?,
+    val tempC: Int?,
+    val description: String?,
+    val icon: String?,
+    val error: String?
 )
 
 data class WeatherUiState(
@@ -30,81 +23,61 @@ data class WeatherUiState(
     val globalError: String? = null
 )
 
-class WeatherViewModel : ViewModel() {
+class WeatherViewModel(
+    private val repository: WeatherRepository
+) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(WeatherUiState())
-    val uiState: StateFlow<WeatherUiState> = _uiState
+    private val queryFlow = MutableStateFlow("")
+    private val globalErrorFlow = MutableStateFlow<String?>(null)
 
-    fun onQueryChange(newValue: String) {
-        _uiState.update { it.copy(query = newValue, globalError = null) }
+    val uiState: StateFlow<WeatherUiState> =
+        combine(
+            queryFlow,
+            repository.observeAll().map { list -> list.map { it.toUiItem() } },
+            globalErrorFlow
+        ) { query, items, error ->
+            WeatherUiState(query, items, error)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), WeatherUiState())
+
+    init {
+        viewModelScope.launch {
+            repository.cleanupExpired()
+        }
     }
 
-    fun removeItem(id: String) {
-        _uiState.update { state ->
-            state.copy(items = state.items.filterNot { it.id == id })
+    fun onQueryChange(value: String) {
+        queryFlow.value = value
+        globalErrorFlow.value = null
+    }
+
+    fun removeCity(query: String) {
+        viewModelScope.launch {
+            repository.deleteCity(query)
         }
     }
 
     fun fetchAndAddCity() {
-        val q = uiState.value.query.trim()
-
+        val q = queryFlow.value.trim()
         if (q.isEmpty()) {
-            _uiState.update { it.copy(globalError = "Syötä kaupunki") }
+            globalErrorFlow.value = "Syötä kaupunki"
             return
         }
-
         if (BuildConfig.OPENWEATHER_API_KEY.isBlank()) {
-            _uiState.update { it.copy(globalError = "API-avain puuttuu") }
+            globalErrorFlow.value = "API-avain puuttuu"
             return
         }
-
-        val loadingItem = CityWeatherItem(query = q, isLoading = true)
-        _uiState.update { it.copy(items = listOf(loadingItem) + it.items, query = "") }
-
         viewModelScope.launch {
-            try {
-                val res: WeatherResponse = RetrofitInstance.api.getWeatherByCity(
-                    city = q,
-                    apiKey = BuildConfig.OPENWEATHER_API_KEY
-                )
-
-                val filled = loadingItem.copy(
-                    cityName = res.name,
-                    tempC = res.main.temp.toInt(),
-                    description = res.weather.firstOrNull()?.description,
-                    icon = res.weather.firstOrNull()?.icon,
-                    isLoading = false,
-                    error = null
-                )
-
-                _uiState.update { state ->
-                    state.copy(items = state.items.map { if (it.id == loadingItem.id) filled else it })
-                }
-            } catch (e: HttpException) {
-                val msg = when (e.code()) {
-                    401 -> "Väärä API-avain (401)"
-                    404 -> "Kaupunkia ei löydy"
-                    else -> "Virhe haussa (${e.code()})"
-                }
-
-                _uiState.update { state ->
-                    state.copy(items = state.items.map {
-                        if (it.id == loadingItem.id) it.copy(isLoading = false, error = msg) else it
-                    })
-                }
-            } catch (_: IOException) {
-                _uiState.update { state ->
-                    state.copy(items = state.items.map {
-                        if (it.id == loadingItem.id) it.copy(isLoading = false, error = "Verkkovirhe") else it
-                    })
-                }
-            } catch (_: Exception) {
-                _uiState.update { state ->
-                    state.copy(items = state.items.map {
-                        if (it.id == loadingItem.id) it.copy(isLoading = false, error = "Tuntematon virhe") else it
-                    })
-                }
-            }
+            repository.refreshIfNeeded(q, BuildConfig.OPENWEATHER_API_KEY)
         }
     }
 }
+
+private fun WeatherEntity.toUiItem() =
+    CityWeatherItem(
+        query = query,
+        cityName = cityName,
+        tempC = tempC,
+        description = description,
+        icon = icon,
+        error = error
+    )
